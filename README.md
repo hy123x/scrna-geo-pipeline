@@ -37,6 +37,25 @@ Phase 7  报告打包     HTML + Seurat对象 + 全部图表
 
 管线会自动识别格式，逐步分析，每完成一步停下来让你审查。
 
+## 安装
+
+### OpenClaw 用户
+
+```bash
+git clone https://github.com/hy123x/scrna-geo-pipeline.git \
+  ~/.openclaw/workspace/skills/scrna-geo-pipeline
+```
+
+安装后在对话中说「单细胞分析 + 数据路径」即可自动触发。
+
+### 手动使用
+
+```bash
+git clone https://github.com/hy123x/scrna-geo-pipeline.git
+```
+
+参考 `SKILL.md` 中的工作流说明，在 R 中按 Phase 0-7 逐步执行。
+
 ## 依赖
 
 ```r
