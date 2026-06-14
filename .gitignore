@@ -1,0 +1,23 @@
+# R
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# macOS
+.DS_Store
+
+# Analysis outputs
+output/
+figures/
+tables/
+*.html
+*.rds
+
+# R package cache
+renv/library/
+renv/local/
+renv/cellar/
+renv/lock/
+packrat/
