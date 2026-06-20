@@ -1,6 +1,6 @@
 ---
 name: "scrna-geo-pipeline"
-description: "GEO单细胞数据集→发表级图表全流程：自动格式识别、分步审查点、CNS可视化、HTML报告 (R/Seurat)"
+description: "GEO单细胞→发表级图表全流程：含远距群亚群验证/污染反向筛查，防同名不同群 (R/Seurat v5)"
 ---
 
 # scrna-geo-pipeline
@@ -27,9 +27,9 @@ R/Seurat 驱动，中文交互，每步出图可审查。
 Phase 0: 数据侦探 → 格式识别 + ENSEMBL转换 → 初检报告
 Phase 1: 质量控制 → MAD阈值 + per-sample统计 + 双细胞检测 → 【审查点①】
 Phase 2: 标准化   → SCT + 细胞周期 + 批次评估 → 【审查点②】
-Phase 3: 降维     → Elbow + Harmony + LISI → UMAP → 【审查点③】
+Phase 3: 降维     → PC数选择(四种方法) + Harmony + UMAP调优 → 【审查点③】
 Phase 4: 聚类     → 多分辨率画廊 + Silhouette → 【审查点④】
-Phase 5: 注释     → SingleR + FeaturePlot + 比例图 → 【审查点⑤】
+Phase 5: 注释     → SingleR + 远距群亚群验证(D) + 污染反向筛查(E) + FeaturePlot + 比例图 → 【审查点⑤】
 Phase 6: 差异分析 → 增强火山 + 热图 + GO网络图 → 【审查点⑥】
 Phase 7: 报告打包 → HTML报告 + 对象保存
 ```
@@ -306,85 +306,176 @@ if (cc_hvg_pct > 15) {
 
 ---
 
-## Phase 3: 降维 + 批次校正
+## ⭐ Phase 3: 降维 + PC数选择 + 批次校正 + UMAP调优
 
 ### 目标
-PCA降维 → 自动选PC数 → Harmony校正（如有批次） → UMAP可视化 → LISI量化评估
+PCA降维 → 四种方法交叉验证选PC数 → Harmony校正 → UMAP参数调优 → LISI量化评估
 
-### Step A: PCA + 自动选PC
+**这个 Phase 决定 UMAP 能不能把 cluster 分开，是最容易被跳过但最关键的步骤。**
+
+### Step A: PCA + 方差分析
 
 ```r
 obj <- RunPCA(obj, npcs = 50, verbose = FALSE)
 
-# Elbow图 + 自动选PC（两条规则取max）：
-# 规则A：连续两点方差下降<0.1%的第一个点
-# 规则B：累积方差>80%所需最少PC数
+# 计算每个 PC 的方差贡献
+pca_stdev <- Stdev(obj, reduction = "pca")
+pca_var <- pca_stdev^2 / sum(pca_stdev^2) * 100
+cum_var <- cumsum(pca_var)
+
+# 打印方差表（前30个PC），标注 <2% 的噪声 PC
+for (i in 1:30) {
+  flag <- if(pca_var[i] < 2) " ⚠噪声" else ""
+  message(sprintf("  PC%2d: %.1f%% (cum: %.1f%%)%s", i, pca_var[i], cum_var[i], flag))
+}
 ```
 
-### Step B: Harmony 批次校正（如有批次效应）
+### ⭐ Step B: 四种方法选 PC 数（必须交叉验证）
+
+**PC 选太少丢信号，选太多掺噪声。这就是 UMAP 分不开的头号原因。**
+
+#### 方法一：Elbow 图拐点（最直观）
+
+```r
+ElbowPlot(obj, ndims = 50) + ggtitle("Elbow Plot — 找到拐点区")
+```
+原理：曲线从「陡坡」变「缓坡」的位置。**每 PC 方差 < 2% 之后基本是噪声。**
+
+#### 方法二：累积方差阈值（最常用）
+
+```r
+pc70 <- which(cum_var >= 70)[1]  # 70% 方差
+pc80 <- which(cum_var >= 80)[1]  # 80% 方差
+pc90 <- which(cum_var >= 90)[1]  # 90% 方差
+```
+
+| 阈值 | 适用场景 | 典型 PC 数 |
+|:---:|------|:---:|
+| 70% | 同组织免疫细胞 | 12-18 |
+| 80% | 跨组织、多样本治疗对比 | 18-25 |
+| 90% | 发育谱系、跨物种 | 25-35 |
+
+**默认取 70% 阈值。** 如果后续 cluster 分不开再升到 80%。
+
+#### 方法三：PC 热图检查技术噪声（最保守但最准）
+
+```r
+# 看 PC1-3 和远端的 PC 对比
+DimHeatmap(obj, dims = c(1:3, 15:17), cells = 500, balanced = TRUE)
+```
+
+判断标准：
+- PC1 top 基因是免疫 vs 基质分离 → ✅ 生物学信号
+- PC25 top 基因全是线粒体/核糖体/热休克蛋白 → ❌ 技术噪声
+- **如果某个 PC 被判定为噪声，该 PC 及之后的所有 PC 都不该放进 UMAP**
+
+#### 方法四：JackStraw（学术最严谨，慢）
+
+```r
+obj <- JackStraw(obj, dims = 50)
+obj <- ScoreJackStraw(obj, dims = 1:50)
+JackStrawPlot(obj, dims = 1:50)
+# 取 p < 0.05 的最后一个显著 PC
+```
+日常探索不必跑，但做 paper 建议加上。
+
+### 决策树
+
+```
+① Elbow 拐点在哪？              → 候选 A
+② 70%/80% 方差需要几个 PC？     → 候选 B
+③ PC 热图有无技术噪声 PC？      → 如有，在噪声 PC 前截断 → 候选 C
+④ JackStraw 显著 PC 数（可选）  → 候选 D
+⑤ 取 A、B、C、D 中最保守的值
+⑥ 永远不超过 50
+```
+
+### Step C: Harmony 批次校正（如有批次效应）
 
 ```r
 obj <- RunHarmony(obj, group.by.vars = "orig.ident", 
                   reduction = "pca", assay.use = "SCT",
-                  dims.use = 1:npc_auto, max.iter.harmony = 20,
-                  theta = 2)  # theta=2适合同种组织不同样本
+                  dims.use = 1:npc, max.iter.harmony = 20,
+                  theta = 2)  # theta=2 适合同种组织不同样本
 ```
 
-### Step C: LISI 量化评估 ⭐ 新增
-
-**比肉眼对比更客观，paper审稿人认可**
+### Step D: LISI 量化评估
 
 ```r
 library(lisi)
 
-# Harmony 前
+# Harmony 前后对比
 lisi_before <- compute_lisi(
-  Embeddings(obj, "pca")[, 1:npc_auto],
-  obj@meta.data,
-  "orig.ident"
-)
-
-# Harmony 后
+  Embeddings(obj, "pca")[, 1:npc], obj@meta.data, "orig.ident")
 lisi_after <- compute_lisi(
-  Embeddings(obj, "harmony")[, 1:npc_auto],
-  obj@meta.data,
-  "orig.ident"
-)
+  Embeddings(obj, "harmony")[, 1:npc], obj@meta.data, "orig.ident")
 
-# LISI = 1 表示完美混合，LISI = N（样本数）表示完全分离
-# 报告 mean(LISI_before) vs mean(LISI_after)
+# LISI ≈ 1 = 完美混合，LISI ≈ N(样本数) = 完全分离
 ```
 
 生成：
-1. **LISI 分布对比小提琴图**（before vs after，一条水平虚线=1）
+1. **LISI 分布对比小提琴图**（before vs after，水平虚线=1）
 2. **Harmony 前后 UMAP 对比**（按样本着色，并排）
 
-### Step D: UMAP
+### ⭐ Step E: UMAP 参数调优
 
 ```r
-obj <- RunUMAP(obj, reduction = if(has_batch) "harmony" else "pca", 
-               dims = 1:npc_auto, verbose = FALSE)
+obj <- RunUMAP(obj, reduction = "harmony",  # 或 "pca"（无批次时）
+               dims = 1:npc,
+               min.dist = if(ncol(obj) > 10000) 0.1 else 0.3,
+               n.neighbors = 30L,
+               verbose = FALSE)
 ```
 
-### 审查点③ —— 展示内容
+**关键参数说明：**
+- **min.dist**（默认 0.3）：点之间的最小距离
+  - 小值（0.01-0.1）：cluster 更散开，适合 >10K 细胞
+  - 大值（0.3-0.5）：cluster 紧凑，强调全局结构
+- **n.neighbors**（默认 30）：局部 vs 全局平衡
+  - 小值（5-15）：保留更多局部结构，但可能把噪声分开
+  - 大值（30-50）：更注重全局结构
 
-1. **Elbow图**（标注推荐PC数 + 两条规则说明）
-2. **UMAP**（按样本着色）
-3. 如有Harmony：**Harmony前后 UMAP 对比 + LISI 小提琴图**
+### 🔧 UMAP 分不开的排查顺序
+
+**PC 数太多是 UMAP 分不开的头号原因。按以下顺序排查：**
+
+1. 🥇 PC 数太多（噪声稀释信号）→ **减到 70% 方差对应的 PC**
+2. 🥈 min.dist 太大 → **降到 0.05-0.1**
+3. 🥉 n.neighbors 不佳 → **试试 15 或 50 对比看效果**
+4. 🤷 本质是连续分化轨迹（如 T 细胞激活梯度）→ **不是 bug，是 biology**
+
+### 审查点③ —— 展示内容（最关键的审查点）
+
+1. **Elbow 图**（标注推荐 PC + 70%/80% 累积线）
+2. **PC 方差表**（前 30 个，标注 <2% 的噪声 PC，含累积%）
+3. **DimHeatmap**（PC1-3 vs 疑似噪声 PC，验证无技术污染）
+4. **UMAP**（按样本 + 按 cell_type 着色）
+5. 如有 Harmony：**前后对比 + LISI 小提琴图**
 
 ```
-📊 降维完成
+📊 降维完成 — PC 数选择报告
 
-推荐PC数: [N]（Elbow拐点=[X], 80%方差需要=[Y]）
-UMAP使用: [pca / harmony] reduction
+方差分布:
+  PC1-10:  [X]%  ← 主要生物学信号
+  PC11-20: [Y]%  ← 次级信号
+  PC21-30: [Z]%  ← 噪声（每个 <2%）
 
-[如有Harmony]
-批次校正效果 (LISI)：
-  Harmony前: [mean_before] → Harmony后: [mean_after]
-  (LISI≈1表示完美混合)
+四项交叉验证:
+  ├─ Elbow 拐点:        [A]
+  ├─ 70% 累积方差:       [B]
+  ├─ 80% 累积方差:       [C]
+  ├─ 技术噪声截断:       PC[D]（之后方差均 <2%）
+  └─ 最终推荐:         [N] PCs
 
-- 回复「继续」→ 用[N]个PC进入聚类
-- 回复「PC=30」→ 自定义PC数
+UMAP: dims=1:[N], min.dist=[X], n.neighbors=[Y]
+
+[如有 Harmony]
+LISI: 前 [before] → 后 [after]（≈1=完美混合）
+
+- 回复「继续」→ 用 [N] 个 PC 进入聚类
+- 回复「PC=20」→ 自定义 PC 数
+- 回复「min.dist=0.05」→ 让 cluster 更散
+- 回复「调整 n.neighbors=15」→ 更多局部结构
 ```
 
 ---
@@ -443,10 +534,42 @@ for (res in resolutions) {
 
 ---
 
-## Phase 5: 细胞注释 + Feature Plot + 比例图
+## ⭐ Phase 5: 细胞注释 + 远距群亚群验证 + 去污染
 
 ### 目标
-SingleR自动注释 → FeaturePlot marker验证 → 细胞比例图 → 用户审核修正。
+SingleR 粗分 → 自动检测远距群（同名不同群）→ 亚群差异分析 → 污染反向筛查 → FeaturePlot 验证 → 用户审核。
+
+**🎯 核心防错机制（GSE181919实战略教训）**：
+1. 先粗分大类，再对每个大类内部做亚群验证（分步注释策略）
+2. UMAP 上距离远的 cluster 同名 → 自动标志「需审查」
+3. 每个大类用阴性 marker 反向筛污染（B/Plasma 里曾发现 319 成纤维 + 202 T 污染！）
+4. Marker 验证不少于 top 10（不是 top 3！top 3 会漏 FOXP3 等关键亚群 marker）
+
+### ⭐ 注释策略核心
+
+**不要只用 SingleR 或简单 marker 命中**——那会导致大部分 cluster 变成 Unclear。用三级加权评分：
+
+**三级 marker 体系**：
+- Level 1 — 谱系大类（weight=3）：Cd3e, Csf1r, Cd79a 等，确定主要身份
+- Level 2 — 亚型（weight=2）：Cd8a, Foxp3, Spp1 等，细分亚群
+- Level 3 — 功能状态（weight=1, 可跨类型）：Mki67, Ifit1, Ccl2 等
+
+**加权评分公式**：
+```
+得分 = (独有 marker 命中 × 2 + 共享 marker 命中 × 1) × 权重
+```
+- 独有 marker = 只有该类型有的（特异性强，如 Foxp3 只有 Treg 有）
+- 共享 marker = 多种类型共有的（仅参考，如 Cd3e 在所有 T 细胞都有）
+
+**置信度分级**：
+- ≥6 分 → ★★★ 高置信
+- 3-5 分 → ★★☆ 中等
+- 1-2 分 → ★☆☆ 低，需人工确认
+- 0 分 → Unclear，不做强行注释
+
+**如果最高分落在 lineage level**，自动尝试退回 subtype level（如 "T_cell" → 检查 CD8_T/CD4_T/Treg 有无命中）。
+
+**优先复用已有 FindAllMarkers 结果**：如果之前跑过且聚类未变，读 CSV 跳过重算（省 5-10 分钟）。
 
 ### Step A: 参考数据库选择
 
@@ -500,7 +623,189 @@ feature_map <- list(
 )
 ```
 
-### Step D: 细胞比例图 ⭐
+### ⭐ Step D: 远距群检测 — 同名 cluster 跨 cluster 交叉验证（新增核心步骤）
+
+**这是解决「UMAP 上两个远处群被标为同一细胞名」的关键步骤。**
+
+#### D1: 计算每个细胞类型跨 cluster 的分布
+
+```r
+# 检测哪些细胞类型分布在多个 cluster
+ct_by_cluster <- table(obj$cell.type, obj$seurat_clusters)
+# 或如果已有 SingleR label:
+# ct_by_cluster <- table(obj$singleR_label, obj$seurat_clusters)
+
+cat("=== 跨多 cluster 的细胞类型检测 ===\n")
+for (ct in rownames(ct_by_cluster)) {
+  n_clusters <- sum(ct_by_cluster[ct, ] > ncol(obj) * 0.01)  # 占比 >1% 的 cluster
+  if (n_clusters >= 2) {
+    main_clusters <- colnames(ct_by_cluster)[ct_by_cluster[ct, ] > ncol(obj) * 0.01]
+    cat(sprintf("⚠️ %s: 分布在 %d 个 cluster → 需亚群验证\n", ct, n_clusters))
+    cat(sprintf("   主要 cluster: %s\n", paste(main_clusters, collapse=", ")))
+  }
+}
+```
+
+#### D2: 对每个多-cluster 细胞类型，跑 FindAllMarkers 看亚群差异
+
+```r
+# 关键：看 top 20（不是 top 3），否则漏掉关键 marker
+for (ct in multi_cluster_types) {
+  sub_obj <- subset(obj, cell.type == ct)
+  Idents(sub_obj) <- "seurat_clusters"
+  
+  sub_markers <- FindAllMarkers(sub_obj, only.pos = TRUE,
+                                min.pct = 0.25, logfc.threshold = 0.25,
+                                max.cells.per.ident = 300)
+  
+  # 打印每个 cluster 的 top 10 marker
+  for (cl in unique(Idents(sub_obj))) {
+    cat(sprintf("\n--- %s Cluster %s top 10 ---\n", ct, cl))
+    sub_markers %>% filter(cluster == cl) %>% head(10) %>% 
+      dplyr::select(gene, avg_log2FC, pct.1) %>% print()
+  }
+}
+```
+
+#### D3: 判断亚群 vs 技术分离
+
+| 标志 | 判断 |
+|------|------|
+| 不同 cluster 的 top 20 marker 大量重叠且都是核糖体/线粒体基因 | ⚠️ 可能低质量分离，考虑合并或删除 |
+| top marker 各有明显不同的功能基因（如 cytotoxic vs Treg） | ✅ 不同功能亚型，需细分注释 |
+| 一个 cluster 被单个样本/批次主导（>80%） | ⚠️ 可能是批次效应 |
+| 所有 cluster 混合多个样本 | ✅ 生物学分离 |
+
+#### D4: 功能亚型注释参考表
+
+**不需要跑新的参考数据库。直接用已有 marker 对照下表判断：**
+
+```r
+# T 细胞亚型参考
+t_subtype_markers <- list(
+  "CD4+_T_naive"       = c("CD4", "CCR7", "SELL", "LEF1"),
+  "CD8+_Tem"           = c("CD8A", "NKG7", "GZMK", "CCL5"),
+  "CD8+_Tex"           = c("CD8A", "GZMB", "PRF1", "LAG3", "PDCD1", "HAVCR2"),
+  "Treg"               = c("FOXP3", "IL2RA", "CTLA4", "BATF", "TNFRSF18"),
+  "T_proliferating"    = c("MKI67", "STMN1", "TYMS", "TOP2A", "KIAA0101"),
+  "MAIT"              = c("TRAV1-2", "SLC4A10", "KLRB1"),
+  "gdT"               = c("TRDC", "TRGC1", "TRGC2")
+)
+
+# B/Plasma 亚型参考
+b_subtype_markers <- list(
+  "Naive_B"        = c("MS4A1", "TCL1A", "FCER2", "IGHD"),
+  "Memory_B"       = c("MS4A1", "CD27", "CD38"),
+  "Plasma_cell"    = c("JCHAIN", "MZB1", "DERL3", "SDC1", "XBP1"),
+  "Plasmablast"    = c("CD38", "MKI67", "PRDM1")
+)
+
+# Myeloid 亚型参考
+myeloid_subtype_markers <- list(
+  "Mono_classical"    = c("CD14", "S100A8", "S100A9", "VCAN"),
+  "Mono_nonclassical" = c("FCGR3A", "CD14"),
+  "Macrophage_M1"     = c("IL1B", "TNF", "CXCL8"),
+  "Macrophage_M2"     = c("CD163", "MRC1", "MSR1"),
+  "DC_cDC1"          = c("CLEC9A", "XCR1", "BATF3"),
+  "DC_cDC2"          = c("FCER1A", "CLEC10A", "CD1C"),
+  "DC_pDC"           = c("LILRA4", "TCF4", "IRF7"),
+  "DC_LAMP3"         = c("LAMP3", "CCL19", "CCL22")
+)
+
+# Fibroblast/CAF 亚型参考
+fibro_subtype_markers <- list(
+  "iCAF"               = c("CXCL12", "CXCL14", "APOD", "GPC3", "DPT"),
+  "myCAF"              = c("POSTN", "CTHRC1", "TAGLN", "ACTA2"),
+  "matrix_CAF"         = c("MFAP5", "PCOLCE2", "FBN1", "CD55"),
+  "perivascular_CAF"   = c("SMOC2", "CLEC14A", "MYOC", "COL15A1"),
+  "resting_fibro"      = c("DCN", "LUM", "COL1A1", "COL1A2")
+)
+
+# Endothelial 亚型参考
+endo_subtype_markers <- list(
+  "Endo_capillary" = c("PECAM1", "CDH5", "CLDN5"),
+  "Endo_arterial"  = c("GJA5", "HEY1", "DLL4"),
+  "Endo_venous"    = c("ACKR1", "SELP", "VCAM1"),
+  "Endo_lymphatic" = c("PROX1", "LYVE1", "PDPN", "CCL21")
+)
+```
+
+**自动注释辅助**：用 AddModuleScore 对每个亚型打分，取最高分者：
+```r
+# 对 T 细胞做亚型打分
+sub_obj <- subset(obj, cell.type == "T cells")
+for (nm in names(t_subtype_markers)) {
+  sub_obj <- AddModuleScore(sub_obj, features = t_subtype_markers[nm], name = nm)
+}
+# 每列取最大值作为亚型
+```
+
+---
+
+### ⭐ Step E: 污染反向筛查（新增核心步骤）
+
+**用阴性 marker 检测被错标的细胞。这是发现「B cells 里混入 T/Fibroblasts」的关键。**
+
+```r
+# 对每种细胞类型，检查不应表达的 marker
+contamination_checks <- list(
+  "T cells" = list(
+    negative = c("MS4A1", "CD79A", "DCN", "COL1A1", "CD68", "EPCAM"),
+    meaning = "B/Fibro/Myeloid/Epithelial marker 不应在 T 细胞高表达"
+  ),
+  "B cells" = list(
+    negative = c("CD3D", "CD3E", "DCN", "COL1A1", "CD68", "CD14"),
+    meaning = "T/Fibro/Myeloid marker 不应在 B 细胞高表达"
+  ),
+  "Fibroblasts" = list(
+    negative = c("CD3D", "CD3E", "MS4A1", "CD79A", "CD68", "PECAM1"),
+    meaning = "免疫/内皮 marker 不应在成纤维细胞高表达"
+  ),
+  "Myeloid" = list(
+    negative = c("CD3D", "CD3E", "MS4A1", "CD79A", "DCN", "EPCAM"),
+    meaning = "T/B/Fibro/Epithelial marker 不应在髓系细胞高表达"
+  ),
+  "Endothelial" = list(
+    negative = c("CD3D", "CD3E", "MS4A1", "DCN", "COL1A1"),
+    meaning = "免疫/基质 marker 不应在内皮细胞高表达"
+  ),
+  "Epithelial/Malignant" = list(
+    negative = c("CD3D", "MS4A1", "CD68", "PECAM1", "DCN"),
+    meaning = "免疫/内皮/基质 marker 不应在上皮/恶性细胞高表达"
+  )
+)
+
+# 执行检测——Seurat v5 用 GetAssayData
+for (ct in names(contamination_checks)) {
+  check <- contamination_checks[[ct]]
+  cells <- WhichCells(obj, expression = cell.type == ct)
+  if (length(cells) == 0) next
+  
+  for (neg_gene in check$negative) {
+    expr <- GetAssayData(obj, assay = "RNA", layer = "data")[neg_gene, cells, drop = FALSE]
+    n_positive <- sum(expr > 1)  # log-normalized 值 > 1 视为阳性
+    if (n_positive > length(cells) * 0.05) {  # 超过 5% 的细胞阳性
+      cat(sprintf("🚨 污染警告: %s 中有 %d 个细胞 (%d%%) 表达 %s, %s\n",
+                  ct, n_positive, round(100*n_positive/length(cells)), 
+                  neg_gene, check$meaning))
+    }
+  }
+}
+```
+
+**如果发现污染**：
+```r
+# 标记污染细胞
+contam_t_in_b <- WhichCells(obj, expression = cell.type == "B_Plasma.cells" & 
+                                          CD3D > 0 & MS4A1 == 0 & CD79A == 0)
+obj$cell_type_clean <- obj$cell.type
+obj$cell_type_clean[contam_t_in_b] <- "T_cells_contam_from_B"
+cat(sprintf("清除污染: %d 个细胞\n", length(contam_t_in_b)))
+```
+
+---
+
+### Step F: 细胞比例图 ⭐
 
 ```r
 # 1. Per-sample cell type proportion bar plot (堆叠柱状图)
@@ -510,32 +815,56 @@ feature_map <- list(
 # 配色使用 cns_palette(n_cell_types_数量)
 ```
 
-### Step E: Marker 验证表
+### Step G: Marker 验证表（深度版）
+
+**不少于 top 10 marker 打印**（原版只打印 top 3，太少了，会漏掉 FOXP3 等关键亚群 marker）：
 
 ```r
 all_markers <- FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25, 
                                logfc.threshold = 0.25)
-top3 <- all_markers %>% group_by(cluster) %>% slice_max(n = 3, order_by = avg_log2FC)
+top10 <- all_markers %>% group_by(cluster) %>% slice_max(n = 10, order_by = avg_log2FC)
 
-# 对照表：Cluster | SingleR | Top Markers | Known Markers | Match
+# 对照表：Cluster | SingleR | Top 10 Markers | Known Markers | Match
 ```
 
 ### 审查点⑤ —— 展示内容（最多的一组图）
 
-1. **UMAP标注图**（SingleR 预测的细胞类型，cns_palette着色）
-2. **Feature Plot画廊**（每种细胞类型2-3个经典marker）
-3. **细胞比例堆叠柱状图**（per-sample）
-4. **细胞比例箱线图**（per-celltype across samples）
-5. **Marker验证对照表**
+1. **UMAP标注图**（注释结果，cns_palette着色）
+2. **远距群检测报告**（哪些类型跨了多个 cluster，每个 cluster 的 top 10 marker → 建议细分命名）
+3. **污染检测报告**（如有，列出污染类型和细胞数）
+4. **Feature Plot画廊**（每种细胞类型2-3个经典marker）
+5. **DotPlot 验证图**（用已知 marker 在所有注释类型上的表达热图）
+6. **细胞比例堆叠柱状图**（per-sample）+ **箱线图**
+7. **Marker验证对照表**（top 10，不是 top 3）
 
 ```
-📊 细胞注释完成
+📊 细胞注释完成 + 亚群验证 + 去污染
 
-SingleR 自动注释: [N]种细胞类型
-Feature Plot验证 + 比例图见附件。
-Marker验证对照表见附件。
+注释: [N]种细胞大类
+
+🔍 远距群亚群检测:
+  ⚠️ T.cells 分布在 5 个 cluster (0, 2, 4, 8, 11)
+     → Cluster 0: 核糖体蛋白 → 静息T
+     → Cluster 2: NKG7, GZMK → CD8+ Tem
+     → Cluster 4: CD8A/B, GZMB, LAG3 → CD8+ Tex
+     → Cluster 8: FOXP3, IL2RA → Treg
+     → Cluster 11: STMN1, TYMS → 增殖T
+     ✨ 建议细分注释为 5 个亚型
+
+  ⚠️ B_Plasma.cells 分布在 3 个 cluster (5, 10, 14)
+     → Cluster 5: MS4A1, HLA-DRA → B细胞
+     → Cluster 10: JCHAIN, DERL3 → 浆细胞
+     → Cluster 14: S100A8, SPRR2 → 待验证
+
+🚨 污染检测:
+  B_Plasma.cells 中: 发现 180 个 T 细胞污染 (CD3D+)
+  B_Plasma.cells 中: 发现 212 个 成纤维细胞污染 (DCN+COL1A1+)
+  → 已标记为 T_contam_from_B / Fibro_contam_from_B
+
+Feature Plot + DotPlot + 比例图 + Marker表见附件。
 
 - 回复「继续」→ 注释OK，进入差异分析
+- 回复「细分 T 细胞」→ 生成 T 细胞精细亚群注释
 - 回复「Cluster X 改成 Y细胞」→ 手动修正
 - 回复「重新注释，用 Blueprint」→ 换参考数据库
 ```
@@ -660,7 +989,11 @@ figures/
 ├── 04_umap_multires.png
 ├── 04_silhouette.png
 ├── 05_umap_annotation.png
+├── 05_umap_fine_annotation.png       # 新增：精细亚群 UMAP
+├── 05_distant_cluster_report.txt      # 新增：远距群报告
+├── 05_contamination_report.txt        # 新增：污染报告
 ├── 05_feature_plots.png
+├── 05_dotplot_validation.png          # 新增：DotPlot 验证
 ├── 05_cell_proportion_bar.png
 ├── 05_cell_proportion_box.png
 ├── 06_volcano.png
@@ -781,10 +1114,16 @@ if (ncol(obj) > 100000) {
 | 双细胞率>10% | 10X过载或组织解离差 | 警告用户检查原始数据 |
 | 细胞周期基因在HVG>25% | 增殖信号太强 | 确认SCT回归S/G2M |
 | LISI Harmony后仍>2 | 批次效应太强 | 换CCA-LIGER或报告给用户 |
+| **远距 cluster 同名** | **注释太粗，没做亚群验证** | **→ Phase 5 Step D 远距群检测 + Step E 污染筛查** |
+| **B/Plasma 里有 T/Fibro marker** | **原始标注误标** | **→ Phase 5 Step E 污染反向筛查，用阴性 marker 过滤** |
+| **UMAP cluster 分不开/糊成一团** | **PC 数太多（噪声稀释）或 min.dist 太大** | **先减 PC 到 70% 方差，再降 min.dist 到 0.05-0.1** |
+| **注释大量 Unclear** | **marker 列表太稀疏（如只定义 9 种类型）** | **补全三级 marker 体系（谱系+亚型+状态），覆盖 30+ 细胞类型** |
 | UMAP全混在一起 | 数据可能已标准化 | 检查Phase 0侦探结果 |
 | FindMarkers全不显著 | 组间差异小 | 降低logfc.threshold |
+| FindAllMarkers 跑太久 | Wilcoxon 在 SCT 下慢 | 复用已有 CSV 结果；或装 presto 包 |
 | 内存不足 | 数据太大 | 降采样 |
 | SCT报错 | 基因太少(已过滤) | 用LogNormalize+ScaleData替代 |
+| Seurat v5 `@data` 报错 | v5 用 layer 替代 slot | 用 `GetAssayData(obj, layer="data")` 代替 `obj@assays$RNA@data` |
 
 ---
 
@@ -798,6 +1137,8 @@ if (ncol(obj) > 100000) {
 └── tables/
     ├── per_sample_qc.csv
     ├── doublet_summary.csv
+    ├── distant_cluster_report.csv    # 新增
+    ├── contamination_report.csv       # 新增
     ├── marker_validation.csv
     └── deg_results.csv
 ```
